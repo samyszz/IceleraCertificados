@@ -1,0 +1,25 @@
+{
+  "name": "icelera-certificados-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend de referência: auth, certificados, PDF, integração Autentique e webhooks.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^11.11.0",
+    "jsonwebtoken": "^9.0.2",
+    "pdfkit": "^0.15.0",
+    "streamifier": "^0.1.1"
+  }
+}

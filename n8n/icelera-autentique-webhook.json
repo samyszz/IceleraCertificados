@@ -1,0 +1,76 @@
+{
+  "name": "iCelera - Webhook Autentique → Backend",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## iCelera · Autentique → n8n → Backend\n\n**Papel do n8n: apenas encaminhar eventos.** O backend decide tudo (e confirma a assinatura consultando o Autentique).\n\n1. No painel do Autentique, cadastre o endpoint de webhook com a *Production URL* do nó 'Webhook Autentique' abaixo e selecione os eventos de assinatura/documento finalizado.\n2. Crie a credencial **Header Auth** 'iCelera Backend Token' → Name: `X-Internal-Token`, Value: o mesmo `INTERNAL_WEBHOOK_TOKEN` do backend/.env.\n3. Defina a URL do backend no nó 'Encaminhar ao Backend iCelera' (ou a variável de ambiente ICELERA_BACKEND_URL no n8n).\n\nEste fluxo NÃO cria documentos, NÃO assina e NÃO altera status por conta própria.",
+        "height": 330,
+        "width": 520,
+        "color": 4
+      },
+      "id": "note-1",
+      "name": "Leia-me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [200, -60]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "autentique-events",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "node-webhook-in",
+      "name": "Webhook Autentique",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [240, 380],
+      "webhookId": "icelera-autentique-events"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Identifica o documento do Autentique no payload do evento.\n// ⚠️ Ajuste os caminhos conforme o payload real (veja a execução de teste no n8n).\nconst body = $json.body || $json;\nconst obj = (body.event && body.event.data && body.event.data.object) || (body.data && body.data.object) || body.object || {};\nconst documentId = (obj.document && (obj.document.id || obj.document)) || obj.document_id || obj.id || null;\nconst eventType = (body.event && body.event.type) || body.type || 'unknown';\n\nif (!documentId) {\n  // Evento sem documento identificável: encerra sem encaminhar.\n  return [];\n}\nreturn [{ json: { documentId: String(documentId), eventType } }];"
+      },
+      "id": "node-extract",
+      "name": "Identificar Documento",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.ICELERA_BACKEND_URL || 'https://SEU-BACKEND') + '/api/internal/signature-events' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ documentId: $json.documentId, eventType: $json.eventType }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "node-forward",
+      "name": "Encaminhar ao Backend iCelera",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 380],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Webhook Autentique": {
+      "main": [[{ "node": "Identificar Documento", "type": "main", "index": 0 }]]
+    },
+    "Identificar Documento": {
+      "main": [[{ "node": "Encaminhar ao Backend iCelera", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
