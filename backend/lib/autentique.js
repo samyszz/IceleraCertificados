@@ -13,7 +13,8 @@ const URL_ = () => process.env.AUTENTIQUE_API_URL || "https://api.autentique.com
 const SANDBOX = () => String(process.env.AUTENTIQUE_SANDBOX || "true").toLowerCase() !== "false";
 
 function headers() {
-  const t = process.env.AUTENTIQUE_API_TOKEN;
+  // Aceita os dois nomes (o .env da raiz usa AUTENTIQUE_TOKEN).
+  const t = process.env.AUTENTIQUE_API_TOKEN || process.env.AUTENTIQUE_TOKEN;
   if (!t) throw Object.assign(new Error("AUTENTIQUE_API_TOKEN não configurado."), { code: "NOT_CONFIGURED" });
   return { Authorization: "Bearer " + t };
 }
@@ -62,10 +63,20 @@ async function getDocument(id) {
   return data.document;
 }
 
+/**
+ * Assina o documento com a conta DONA DO TOKEN de API (docs: signDocument).
+ * Usado na emissão automática: o token precisa ser da conta do Alison e o e-mail
+ * dele precisa estar como signatário do documento — senão a API devolve "signature_not_found".
+ */
+async function signDocument(documentId) {
+  const data = await gql(`mutation($id: UUID!) { signDocument(id: $id) }`, { id: documentId });
+  return data.signDocument === true;
+}
+
 async function downloadFile(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error("Falha ao baixar o PDF assinado (HTTP " + res.status + ").");
   return Buffer.from(await res.arrayBuffer());
 }
 
-module.exports = { createDocument, createSignatureLink, getDocument, downloadFile };
+module.exports = { createDocument, createSignatureLink, signDocument, getDocument, downloadFile };
