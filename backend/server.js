@@ -600,6 +600,7 @@ async function autoIssue(certId) {
     }
 
     await autentique.signDocument(c.autentiqueDocId);
+    if (c.autoIssueError) await ref.update({ autoIssueError: null, updatedAt: now() });
     await log(c.id, "ASSINATURA_AUTOMATICA", signerNameCfg() || "Sistema", "Assinado automaticamente via Autentique após aprovação no questionário");
     lastSync.set(c.id, Date.now());
     // O PDF assinado pode levar alguns segundos para ficar pronto; se não ficar agora,
@@ -640,10 +641,24 @@ async function certFromLink(req, res, link) {
   return snap.data();
 }
 
+// Assim que o Autentique confirma a assinatura o PDF já pode ser baixado
+// (sendCertificatePdf busca direto no Autentique se o Cloudinary ainda não tiver a cópia).
 const publicStatus = c => ({
   status: SIGNED.includes(c.status) ? "ASSINADO" : c.status,
-  pdfReady: !!(c.pdfUrl || c.status === "EMITIDO")
+  pdfReady: SIGNED.includes(c.status),
+  issueFailed: !SIGNED.includes(c.status) && !!c.autoIssueError
 });
+
+/** Aprovado mas ainda não assinado: tenta (de novo) emitir e assinar, no máximo a cada 15 s. */
+const lastRetry = new Map();
+async function advanceIssue(c) {
+  if (SIGNED.includes(c.status) || !c.quizPassedAt) return c;
+  if (String(c.autoIssueError || "").includes("não configurado")) return c; // sem config, não adianta repetir
+  if (Date.now() - (lastRetry.get(c.id) || 0) < 15000) return c;
+  lastRetry.set(c.id, Date.now());
+  await autoIssue(c.id);
+  return (await db.collection('certificates').doc(c.id).get()).data();
+}
 
 /* ---- Rotas públicas (sem login) ---- */
 app.get("/api/public/quiz/:token", publicLimit, async (req, res, next) => {
@@ -717,7 +732,7 @@ app.post("/api/public/quiz/:token/:certId", publicLimit, async (req, res, next) 
     await log(c0.id, passed ? "QUESTIONARIO_APROVADO" : "QUESTIONARIO_REPROVADO", c0.traineeName,
       `Acertou ${correct} de ${total} (${percent}%) · tentativa ${out.attempts}${quiz.maxAttempts ? " de " + quiz.maxAttempts : ""}`);
 
-    if (passed) await autoIssue(c0.id);
+    if (passed) { lastRetry.set(c0.id, Date.now()); await autoIssue(c0.id); }
 
     const c = (await ref.get()).data();
     res.json({
@@ -733,11 +748,13 @@ app.get("/api/public/quiz/:token/:certId/status", publicLimit, async (req, res, 
   try {
     const link = await linkFromReq(req, res); if (!link) return;
     let c = await certFromLink(req, res, link); if (!c) return;
-    if (c.autentiqueDocId && c.status !== "EMITIDO" && Date.now() - (lastSync.get(c.id) || 0) > 5000) {
+    if (c.autentiqueDocId && !SIGNED.includes(c.status) && Date.now() - (lastSync.get(c.id) || 0) > 4000) {
       lastSync.set(c.id, Date.now());
       try { await syncFromAutentique(c.autentiqueDocId); } catch (e) { console.warn("[public sync] " + e.message); }
       c = (await db.collection('certificates').doc(c.id).get()).data();
     }
+    // Se a assinatura automática falhou ou não chegou a rodar, tenta de novo.
+    c = await advanceIssue(c);
     res.json(publicStatus(c));
   } catch (e) { next(e); }
 });

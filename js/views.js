@@ -2062,13 +2062,13 @@
       `);
       $("#qp-back").onclick = pick;
       bindPdf(id);
-      if (!ready && q.status !== "AGUARDANDO_ASSINATURA") poll(id);
+      if (!ready) poll(id);
     }
 
     const certState = s => s.pdfReady
       ? `<p class="muted">O seu certificado foi emitido e assinado digitalmente.</p><button class="btn orange lg" id="qp-pdf">${icon("download")} Baixar certificado</button>`
-      : s.status === "AGUARDANDO_ASSINATURA"
-        ? `<p class="muted">O seu certificado será assinado e enviado pela equipe iCelera em breve.</p>`
+      : s.issueFailed
+        ? `<div class="waiting"><span class="spinner"></span> Estamos finalizando a assinatura do seu certificado…</div><p class="muted">Se demorar, a equipe iCelera conclui a emissão e você pode voltar a este link mais tarde para baixar.</p>`
         : `<div class="waiting"><span class="spinner"></span> Emitindo e assinando o seu certificado…</div>`;
 
     function bindPdf(id) {
@@ -2085,14 +2085,21 @@
 
     function poll(id) {
       stop();
-      let n = 0;
-      timer = setInterval(async () => {
-        if (++n > 60) { stop(); const c = $("#qp-cert"); if (c) c.innerHTML = `<p class="muted">A emissão está demorando mais que o normal. Volte a este link mais tarde para baixar o seu certificado.</p>`; return; }
+      let n = 0, busy = false, last = "";
+      const check = async () => {
+        if (busy) return;
+        if (++n > 90) { stop(); const c = $("#qp-cert"); if (c) c.innerHTML = `<p class="muted">A emissão está demorando mais que o normal. Volte a este link mais tarde para baixar o seu certificado.</p>`; return; }
+        busy = true;
         try {
           const s = await Api.publicStatus(token, id);
-          if (s.pdfReady) { stop(); const c = $("#qp-cert"); if (c) { c.innerHTML = certState(s); bindPdf(id); } }
+          const html = certState(s), c = $("#qp-cert");
+          if (c && html !== last) { last = html; c.innerHTML = html; bindPdf(id); }
+          if (s.pdfReady) stop();
         } catch { }
-      }, 3000);
+        busy = false;
+      };
+      check(); // primeira consulta na hora, sem esperar o intervalo
+      timer = setInterval(check, 2000);
     }
 
     pick();
