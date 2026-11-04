@@ -10,9 +10,11 @@
   const SESSION_KEY = "icelera.session.v1";
   const TOKEN_KEY = "icelera.token.v1";
 
-  const PENDING = ["RASCUNHO", "AGUARDANDO_ASSINATURA", "ASSINATURA_EM_ANDAMENTO"];
+  const PENDING = ["AGUARDANDO_QUESTIONARIO", "RASCUNHO", "AGUARDANDO_ASSINATURA", "ASSINATURA_EM_ANDAMENTO"];
   const SIGNED = ["ASSINADO", "EMITIDO"];
-  const EDITABLE = ["RASCUNHO", "AGUARDANDO_ASSINATURA"];
+  const EDITABLE = ["AGUARDANDO_QUESTIONARIO", "RASCUNHO", "AGUARDANDO_ASSINATURA"];
+  const PASSED = ["AGUARDANDO_ASSINATURA", "ASSINATURA_EM_ANDAMENTO", "ASSINADO", "EMITIDO"];
+  const QD = window.ICELERA_QUIZ_DEFAULTS || { passPercent: 70, maxAttempts: 3, byEquipment: {} };
 
   class ApiError extends Error {
     constructor(message, code) { super(message); this.code = code || "ERROR"; }
@@ -146,12 +148,14 @@
           date: training.date, format: training.format, hours: training.hours.trim(),
           trainingTitle: CFG.TRAINING_TITLE,
           technicianId: user.id, technicianName: user.name,
-          status: "AGUARDANDO_ASSINATURA",
+          instructorName: training.instructorName, propertyDocType: training.propertyDocType,
+          status: "AGUARDANDO_QUESTIONARIO", quizAttempts: 0, quizPassedAt: null,
           autentiqueDocId: null, signedAt: null, issuedAt: null, signedBy: null, pdfUrl: null,
           createdAt: nowIso(), updatedAt: nowIso()
         };
+        if (training.title) c.trainingTitle = training.title;
         db.certificates.push(c); created.push(c);
-        this._log(db, id, "ENVIADO_AO_COORDENADOR", user.name, "Certificado criado e enviado para assinatura");
+        this._log(db, id, "CRIADO", user.name, "Certificado criado. Aguardando o treinado responder o questionário");
       }
       this._save(db);
       return { trainingId, created, skipped };
@@ -178,6 +182,7 @@
       const c = db.certificates.find(x => x.id === id);
       if (!c) throw new ApiError("Certificado não encontrado.", "NOT_FOUND");
       if (SIGNED.includes(c.status)) throw new ApiError("Este certificado já foi assinado.", "ALREADY_SIGNED");
+      if (c.status === "AGUARDANDO_QUESTIONARIO") throw new ApiError("O treinado ainda não foi aprovado no questionário.");
       if (c.status !== "ASSINATURA_EM_ANDAMENTO") {
         c.status = "ASSINATURA_EM_ANDAMENTO";
         c.autentiqueDocId = c.autentiqueDocId || "mock-doc-" + Math.random().toString(16).slice(2, 10);
@@ -204,6 +209,89 @@
 
     async listHistory() { await delay(80); this._user(); return this._db().history.slice(0, 100); },
     async downloadPdf() { window.print(); },
+
+    /* ---- Questionário (simulação local) ---- */
+    _quiz(db, eq) {
+      const saved = (db.quizzes || {})[eq];
+      if (saved) return { ...saved, custom: true };
+      return { equipment: eq, passPercent: QD.passPercent, maxAttempts: QD.maxAttempts, custom: false,
+        questions: (QD.byEquipment[eq] || []).map((q, i) => ({ id: "q" + (i + 1), ...q })) };
+    },
+    _state(c, quiz) {
+      if (c.quizPassedAt || PASSED.includes(c.status)) return "APROVADO";
+      if (quiz.maxAttempts > 0 && (c.quizAttempts || 0) >= quiz.maxAttempts) return "BLOQUEADO";
+      return "PENDENTE";
+    },
+    _link(token) {
+      const db = this._db();
+      const l = (db.quizLinks || []).find(x => x.token === token);
+      if (!l) throw new ApiError("Link inválido ou desativado.", "NOT_FOUND");
+      return { db, l };
+    },
+    _linkCert(token, id) {
+      const { db, l } = this._link(token);
+      const c = db.certificates.find(x => x.id === id && propertyKey(x.propertyName, x.propertyDoc) === l.propertyKey);
+      if (!c) throw new ApiError("Treinado não encontrado neste link.", "NOT_FOUND");
+      return { db, l, c, quiz: this._quiz(db, c.equipment) };
+    },
+    async getQuizLink({ propertyName, propertyDoc }) {
+      await delay(150); this._user();
+      const db = this._db(); db.quizLinks = db.quizLinks || [];
+      const key = propertyKey(propertyName, propertyDoc);
+      let l = db.quizLinks.find(x => x.propertyKey === key);
+      if (!l) { l = { token: Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2), propertyKey: key, propertyName, propertyDoc }; db.quizLinks.push(l); this._save(db); }
+      return l;
+    },
+    async listQuizzes() { await delay(80); this._user(); const db = this._db(); return CFG.EQUIPMENTS.map(e => this._quiz(db, e)); },
+    async saveQuiz(equipment, quiz) {
+      await delay(200); const u = this._user();
+      if (!quiz.questions.length) throw new ApiError("Cadastre ao menos uma pergunta.");
+      const db = this._db(); db.quizzes = db.quizzes || {};
+      db.quizzes[equipment] = { ...quiz, equipment, questions: quiz.questions.map((q, i) => ({ ...q, id: q.id || "q" + Date.now().toString(36) + i })), updatedAt: nowIso(), updatedBy: u.name };
+      this._save(db); return { ...db.quizzes[equipment], custom: true };
+    },
+    async resetQuiz(id) {
+      await delay(150); const u = this._role("TECNICO");
+      const db = this._db(); const c = db.certificates.find(x => x.id === id);
+      c.quizAttempts = 0; this._log(db, id, "TENTATIVAS_LIBERADAS", u.name, "Tentativas do questionário liberadas novamente"); this._save(db); return c;
+    },
+    async publicQuiz(token) {
+      await delay(150);
+      const { db, l } = this._link(token);
+      const certs = db.certificates.filter(c => propertyKey(c.propertyName, c.propertyDoc) === l.propertyKey && (c.status === "AGUARDANDO_QUESTIONARIO" || c.quizPassedAt));
+      return { propertyName: l.propertyName, trainees: certs.map(c => ({ id: c.id, name: c.traineeName, equipment: c.equipment, date: c.date, state: this._state(c, this._quiz(db, c.equipment)) })).sort((a, b) => a.name.localeCompare(b.name, "pt-BR")) };
+    },
+    _pub2(c) { return { status: SIGNED.includes(c.status) ? "ASSINADO" : c.status, pdfReady: c.status === "EMITIDO" }; },
+    async publicQuizFor(token, id) {
+      await delay(120);
+      const { c, quiz } = this._linkCert(token, id);
+      const state = this._state(c, quiz);
+      const base = { id: c.id, name: c.traineeName, equipment: c.equipment, state, attemptsUsed: c.quizAttempts || 0, maxAttempts: quiz.maxAttempts, passPercent: quiz.passPercent, ...this._pub2(c) };
+      if (state !== "PENDENTE") return base;
+      return { ...base, questions: quiz.questions.map(q => ({ id: q.id, text: q.text, options: q.options })) };
+    },
+    async submitQuiz(token, id, answers) {
+      await delay(600);
+      const { db, c, quiz } = this._linkCert(token, id);
+      if (c.status !== "AGUARDANDO_QUESTIONARIO") throw new ApiError("Este questionário já foi respondido e aprovado.");
+      if (this._state(c, quiz) === "BLOQUEADO") throw new ApiError("Você atingiu o limite de tentativas. Fale com o técnico que ministrou o treinamento.");
+      if (quiz.questions.some(q => !Number.isInteger(answers[q.id]))) throw new ApiError("Responda todas as perguntas antes de enviar.");
+      const correct = quiz.questions.filter(q => answers[q.id] === q.correct).length, total = quiz.questions.length;
+      const percent = Math.round(correct / total * 100), passed = percent >= quiz.passPercent;
+      c.quizAttempts = (c.quizAttempts || 0) + 1;
+      this._log(db, c.id, passed ? "QUESTIONARIO_APROVADO" : "QUESTIONARIO_REPROVADO", c.traineeName, `Acertou ${correct} de ${total} (${percent}%) · tentativa ${c.quizAttempts}${quiz.maxAttempts ? " de " + quiz.maxAttempts : ""}`);
+      if (passed) {
+        const signer = (db.users.find(u => u.role === "COORDENADOR") || {}).name || "Coordenador";
+        Object.assign(c, { quizPassedAt: nowIso(), status: "EMITIDO", autentiqueDocId: "mock-doc-" + c.id.toLowerCase(), signedAt: nowIso(), issuedAt: nowIso(), signedBy: signer });
+        this._log(db, c.id, "ASSINATURA_AUTOMATICA", signer, "Assinado automaticamente via Autentique após aprovação no questionário (simulação)");
+        this._log(db, c.id, "EMITIDO", "Sistema", "Certificado final emitido");
+      }
+      this._save(db);
+      return { passed, correct, total, percent, passPercent: quiz.passPercent, attemptsUsed: c.quizAttempts, maxAttempts: quiz.maxAttempts, state: this._state(c, quiz), ...this._pub2(c) };
+    },
+    async publicStatus(token, id) { const { c } = this._linkCert(token, id); return this._pub2(c); },
+    async publicCertificate(token, id) { return this._linkCert(token, id).c; },
+    async publicPdf() { window.print(); },
     resetDemo() { localStorage.removeItem(DB_KEY); }
   };
 
@@ -247,6 +335,21 @@
     removeProperty: body => req("/properties-bulk", { method: "DELETE", body }),
     startSigning: id => req("/certificates/" + id + "/sign", { method: "POST" }),
     listHistory: () => req("/history"),
+    getQuizLink: body => req("/quiz-links", { method: "POST", body }),
+    listQuizzes: () => req("/quizzes"),
+    saveQuiz: (equipment, quiz) => req("/quizzes/" + encodeURIComponent(equipment), { method: "PUT", body: quiz }),
+    resetQuiz: id => req("/certificates/" + id + "/reset-quiz", { method: "POST" }),
+    publicQuiz: token => req("/public/quiz/" + encodeURIComponent(token)),
+    publicQuizFor: (token, id) => req("/public/quiz/" + encodeURIComponent(token) + "/" + encodeURIComponent(id)),
+    submitQuiz: (token, id, answers) => req("/public/quiz/" + encodeURIComponent(token) + "/" + encodeURIComponent(id), { method: "POST", body: { answers } }),
+    publicStatus: (token, id) => req("/public/quiz/" + encodeURIComponent(token) + "/" + encodeURIComponent(id) + "/status"),
+    async publicPdf(token, id) {
+      const res = await req("/public/quiz/" + encodeURIComponent(token) + "/" + encodeURIComponent(id) + "/pdf", { raw: true });
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob); a.download = "Certificado-" + id + ".pdf"; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    },
     async downloadPdf(id) {
       const res = await req("/certificates/" + id + "/pdf", { raw: true });
       const blob = await res.blob();
@@ -259,5 +362,5 @@
   window.ApiError = ApiError;
   window.Api = CFG.API_MODE === "http" ? Http : Mock;
   window.Api.mode = CFG.API_MODE === "http" ? "http" : "mock";
-  window.Api.PENDING = PENDING; window.Api.SIGNED = SIGNED; window.Api.EDITABLE = EDITABLE;
+  window.Api.PENDING = PENDING; window.Api.SIGNED = SIGNED; window.Api.EDITABLE = EDITABLE; window.Api.PASSED = PASSED;
 })();
