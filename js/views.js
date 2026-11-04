@@ -785,7 +785,7 @@
         <div class="notice">
           ${icon("send")}
           <span>
-            Serão criados <b>${wiz.trainees.length} certificado(s)</b>, um para cada treinado, com status <b>Aguardando assinatura</b>. O PDF só é emitido depois que o Coordenador assinar.
+            Serão criados <b>${wiz.trainees.length} certificado(s)</b>, um para cada treinado, com status <b>Aguardando questionário</b>. Depois é só enviar o link do questionário para a instituição: quem for aprovado recebe o certificado assinado automaticamente.
           </span>
         </div>
 
@@ -793,7 +793,7 @@
 
         <div class="wiz-actions">
           <button class="btn ghost" id="w-back">Voltar</button>
-          <button class="btn primary lg" id="w-send">${icon("send")} Enviar ao Coordenador</button>
+          <button class="btn primary lg" id="w-send">${icon("send")} Cadastrar treinados</button>
         </div>
       `;
     }
@@ -828,7 +828,9 @@
             JSON.stringify({
               created: res.created.length,
               skipped: res.skipped,
-              first: res.created[0] ? res.created[0].traineeName : ""
+              first: res.created[0] ? res.created[0].traineeName : "",
+              propertyName: wiz.training.propertyName,
+              propertyDoc: wiz.training.propertyDoc
             })
           );
 
@@ -841,7 +843,7 @@
           er.hidden = false;
 
           btn.disabled = false;
-          btn.innerHTML = icon("send") + " Enviar ao Coordenador";
+          btn.innerHTML = icon("send") + " Cadastrar treinados";
         }
       };
     }
@@ -866,16 +868,18 @@
       <section class="card success-card">
         <div class="success-ic plane">${icon("send")}</div>
 
-        <h1>${n ? "Certificados enviados com sucesso!" : "Nenhum certificado novo"}</h1>
+        <h1>${n ? "Treinados cadastrados!" : "Nenhum certificado novo"}</h1>
 
         <p class="muted">
           ${n
             ? (n === 1
-              ? `O certificado de <b>${esc(r.first)}</b> foi enviado ao Coordenador para assinatura.`
-              : `<b>${n} certificados</b> foram enviados ao Coordenador para assinatura.`)
+              ? `<b>${esc(r.first)}</b> já pode responder o questionário.`
+              : `<b>${n} treinados</b> já podem responder o questionário.`) + " Envie o link da instituição para eles: quem for aprovado recebe o certificado assinado automaticamente."
             : "Todos os treinados informados já possuem certificado para este treinamento."
           }
         </p>
+
+        ${n && r.propertyName ? `<button class="btn orange lg" id="sent-link">${icon("link")} Link do questionário</button>` : ""}
 
         ${skipped.length
           ? `<div class="notice warn">${icon("alert")}<span>${skipped.length} treinado(s) já tinham certificado e não foram duplicados: ${skipped.map(s => esc(s.name)).join(", ")}.</span></div>`
@@ -888,6 +892,9 @@
         </div>
       </section>
     `);
+
+    const sl = $("#sent-link");
+    if (sl) sl.onclick = () => shareQuizLink(r.propertyName, r.propertyDoc);
   }
 
   /* ---------------------------------------------------------------- */
@@ -912,6 +919,23 @@
 
     let filter = "";
     let openSet = null;
+
+    // Limite de tentativas por equipamento (para mostrar "1/3" e o botão de liberar).
+    const quizCfg = {};
+    if (all.some(c => c.status === "AGUARDANDO_QUESTIONARIO")) {
+      try { (await Api.listQuizzes()).forEach(q => { quizCfg[q.equipment] = q; }); } catch { }
+    }
+    all.forEach(c => {
+      const q = quizCfg[c.equipment];
+      c.quizMax = q ? q.maxAttempts : 0;
+      c.quizBlocked = c.status === "AGUARDANDO_QUESTIONARIO" && c.quizMax > 0 && (c.quizAttempts || 0) >= c.quizMax;
+    });
+    const quizNote = c => {
+      if (c.status !== "AGUARDANDO_QUESTIONARIO") return c.quizPassedAt ? `<small>Aprovado no questionário${c.quizBestPercent != null ? " · " + c.quizBestPercent + "%" : ""}</small>` : "";
+      const n = c.quizAttempts || 0;
+      if (!n) return `<small>Ainda não respondeu</small>`;
+      return `<small class="${c.quizBlocked ? "danger-text" : ""}">${c.quizBlocked ? "Sem tentativas · " : ""}${n}${c.quizMax ? "/" + c.quizMax : ""} tentativa(s)${c.quizBestPercent != null ? " · melhor nota " + c.quizBestPercent + "%" : ""}</small>`;
+    };
 
     App.page("#/certificados/" + tab, `
       <div class="page-head">
@@ -945,6 +969,12 @@
 
       if (isSigned(c)) {
         a += `<button class="btn primary sm" data-pdf="${c.id}">${icon("download")} Baixar PDF</button>`;
+      } else if (c.status === "AGUARDANDO_QUESTIONARIO") {
+        if (tec) a += `
+          ${c.quizBlocked ? `<button class="btn outline sm" data-reset="${c.id}">${icon("refresh")} Liberar tentativas</button>` : ""}
+          <button class="btn outline sm" data-edit="${c.id}">${icon("edit")} Editar</button>
+          <button class="btn ghost sm" data-del="${c.id}">${icon("trash")} Remover</button>
+        `;
       } else if (!tec) {
         a += `<a class="btn primary sm" href="#/assinar/${c.id}">${icon("pen")} Assinar certificado</a>`;
       } else if (Api.EDITABLE.includes(c.status)) {
@@ -990,6 +1020,9 @@
                   <span class="count">${items.length}</span>
                 </button>
 
+                ${items.some(c => c.status === "AGUARDANDO_QUESTIONARIO" || c.quizPassedAt)
+                  ? `<button class="btn outline sm qlink-btn" data-qlink="${esc(n)}" title="Link do questionário desta instituição">${icon("link")} <span>Link do questionário</span></button>`
+                  : ""}
                 ${tec
                   ? `<button class="icon-btn" data-pedit="${esc(n)}" title="Editar propriedade">${icon("edit")}</button>
                      <button class="icon-btn danger" data-pdel="${esc(n)}" title="Remover propriedade">${icon("trash")}</button>`
@@ -1009,7 +1042,7 @@
 
                     <span data-l="Equipamento">${esc(c.equipment)}</span>
                     <span data-l="Data">${fmtDate(c.date)}</span>
-                    <span data-l="Status">${badge(c.status)}</span>
+                    <span data-l="Status">${badge(c.status)}${quizNote(c)}</span>
                     <span class="actions">${actions(c)}</span>
                   </div>
                 `).join("")}
@@ -1037,6 +1070,30 @@
       const p = e.target.closest("[data-pdf]");
 
       if (p) return downloadPdf(p.dataset.pdf);
+
+      const ql = e.target.closest("[data-qlink]");
+
+      if (ql) {
+        const sample = all.find(x => x.propertyName === ql.dataset.qlink);
+        return shareQuizLink(sample.propertyName, sample.propertyDoc);
+      }
+
+      const rs = e.target.closest("[data-reset]");
+
+      if (rs) {
+        const c = all.find(x => x.id === rs.dataset.reset);
+
+        return modal({
+          title: "Liberar tentativas",
+          confirmText: "Liberar",
+          body: `<p><b>${esc(c.traineeName)}</b> usou todas as tentativas do questionário. Liberar para responder novamente?</p>`,
+          onConfirm: async () => {
+            await Api.resetQuiz(c.id);
+            toast("Tentativas liberadas.");
+            management(tab);
+          }
+        });
+      }
 
       const del = e.target.closest("[data-del]");
 
@@ -1245,7 +1302,7 @@
           ${badge(c.status)}
           ${isSigned(c)
             ? `<button class="btn primary" id="pdf">${icon("download")} Baixar PDF</button>`
-            : (!tec
+            : (!tec && c.status !== "AGUARDANDO_QUESTIONARIO"
               ? `<a class="btn primary" href="#/assinar/${c.id}">${icon("pen")} Assinar certificado</a>`
               : "")
           }
@@ -1274,6 +1331,12 @@
 
     if (isSigned(c)) {
       location.hash = "#/emitido/" + id;
+      return;
+    }
+
+    if (c.status === "AGUARDANDO_QUESTIONARIO") {
+      toast("Este treinado ainda não foi aprovado no questionário.", "error");
+      location.hash = "#/certificado/" + id;
       return;
     }
 
@@ -1324,6 +1387,8 @@
 
         <section class="card pad">
           <h3>Assinatura Digital</h3>
+
+          ${c.autoIssueError ? `<div class="notice warn">${icon("alert")}<span>A emissão automática não conseguiu concluir a assinatura. Assine manualmente abaixo.</span></div>` : ""}
 
           <p class="muted">
             O certificado será assinado digitalmente através do <b>Autentique</b>,
@@ -1525,7 +1590,13 @@
     ASSINATURA_INICIADA: ["pen", "Assinatura iniciada"],
     ASSINADO: ["check", "Assinado"],
     EMITIDO: ["award", "Certificado emitido"],
-    REMOVIDO: ["trash", "Removido"]
+    REMOVIDO: ["trash", "Removido"],
+    CRIADO: ["plus", "Treinado cadastrado"],
+    QUESTIONARIO_APROVADO: ["check", "Aprovado no questionário"],
+    QUESTIONARIO_REPROVADO: ["x", "Reprovado no questionário"],
+    TENTATIVAS_LIBERADAS: ["refresh", "Tentativas liberadas"],
+    ASSINATURA_AUTOMATICA: ["shield", "Assinado automaticamente"],
+    EMISSAO_AUTOMATICA_FALHOU: ["alert", "Falha na emissão automática"]
   };
 
   async function history() {
@@ -1640,7 +1711,395 @@
     }
   }
 
+  /* ---------------------------------------------------------------- */
+  /* Link do questionário (1 por instituição)                          */
+  /* ---------------------------------------------------------------- */
+  const quizUrl = token => location.origin + location.pathname + "#/q/" + token;
+
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); return true; }
+    catch {
+      const t = document.createElement("textarea");
+      t.value = text; document.body.appendChild(t); t.select();
+      let ok = false; try { ok = document.execCommand("copy"); } catch { }
+      t.remove(); return ok;
+    }
+  }
+
+  async function shareQuizLink(propertyName, propertyDoc) {
+    let link;
+    try { link = await Api.getQuizLink({ propertyName, propertyDoc }); }
+    catch (e) { return toast(errMsg(e), "error"); }
+    const url = quizUrl(link.token);
+    const msg = `Olá! Para receber o certificado do treinamento iCelera, responda o questionário neste link e selecione o seu nome: ${url}`;
+
+    const m = modal({
+      title: "Link do questionário",
+      confirmText: "Copiar link",
+      cancelText: "Fechar",
+      body: `
+        <p class="muted">Envie este link para os treinados da <b>${esc(propertyName)}</b>. Cada pessoa escolhe o próprio nome e responde o questionário do seu equipamento. Quem for aprovado recebe o certificado assinado automaticamente.</p>
+        <div class="qlink-box">
+          <input class="input" id="ql-url" readonly value="${esc(url)}">
+        </div>
+        <div class="btn-row">
+          <a class="btn outline sm" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(msg)}">${icon("whatsapp")} Enviar por WhatsApp</a>
+          <button class="btn ghost sm" id="ql-msg">${icon("copy")} Copiar mensagem pronta</button>
+          <a class="btn ghost sm" target="_blank" rel="noopener" href="${esc(url)}">${icon("external")} Abrir</a>
+        </div>
+        <p class="muted small">O link é o mesmo para todos os treinamentos desta instituição. Treinados novos aparecem nele automaticamente.</p>
+      `,
+      onConfirm: async () => {
+        toast((await copyText(url)) ? "Link copiado." : "Não foi possível copiar. Selecione e copie manualmente.", "info");
+      }
+    });
+    $("#ql-url", m).onclick = e => e.target.select();
+    $("#ql-msg", m).onclick = async () => toast((await copyText(msg)) ? "Mensagem copiada." : "Não foi possível copiar.");
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Editor de questionários (um por equipamento)                      */
+  /* ---------------------------------------------------------------- */
+  async function quizzes() {
+    const list = await Api.listQuizzes();
+    const state = {};
+    list.forEach(q => { state[q.equipment] = JSON.parse(JSON.stringify(q)); });
+    let cur = sessionStorage.getItem("icelera.quizTab");
+    if (!state[cur]) cur = list[0] && list[0].equipment;
+    let dirty = false;
+
+    App.page("#/questionarios", `
+      <div class="page-head">
+        <h1>Questionários</h1>
+        <p class="muted">Cada equipamento tem o seu questionário. O treinado precisa ser aprovado para o certificado ser emitido.</p>
+      </div>
+      <nav class="tabs" id="qz-tabs"></nav>
+      <div id="qz-body"></div>
+    `);
+
+    const onUnload = e => { if (dirty) { e.preventDefault(); e.returnValue = ""; } };
+    window.addEventListener("beforeunload", onUnload);
+    App.onLeave(() => window.removeEventListener("beforeunload", onUnload));
+
+    // Lê o que está na tela para o estado (antes de redesenhar).
+    function collect() {
+      const q = state[cur]; if (!q || !$("#qz-pass")) return;
+      q.passPercent = parseInt($("#qz-pass").value, 10);
+      q.maxAttempts = parseInt($("#qz-max").value, 10);
+      $$(".qz-q").forEach((el, i) => {
+        const item = q.questions[i];
+        item.text = $(".qz-text", el).value;
+        item.options = $$(".qz-opt input[type=text]", el).map(x => x.value);
+        const r = $(".qz-opt input[type=radio]:checked", el);
+        item.correct = r ? +r.value : -1;
+      });
+    }
+
+    function draw() {
+      const q = state[cur];
+      $("#qz-tabs").innerHTML = list.map(x => `<a href="javascript:void 0" data-tab="${esc(x.equipment)}" class="${x.equipment === cur ? "active" : ""}">${esc(x.equipment)} <span class="count">${state[x.equipment].questions.length}</span></a>`).join("");
+
+      $("#qz-body").innerHTML = `
+        ${!q.custom ? `<div class="notice warn">${icon("alert")}<span>Estas perguntas são um <b>exemplo</b> montado a partir do conteúdo programático. Revise e salve antes de enviar o link aos clientes.</span></div>` : `<p class="muted small qz-meta">Última alteração ${q.updatedAt ? fmtDateTime(q.updatedAt) : ""}${q.updatedBy ? " por " + esc(q.updatedBy) : ""}</p>`}
+
+        <section class="card pad qz-settings">
+          <label class="field">
+            <span>Nota mínima para aprovação</span>
+            <div class="input-suffix"><input class="input" type="number" min="1" max="100" id="qz-pass" value="${esc(q.passPercent)}"><b>%</b></div>
+          </label>
+          <label class="field">
+            <span>Tentativas por treinado</span>
+            <select class="input" id="qz-max">
+              ${[0, 1, 2, 3, 4, 5, 10].map(n => `<option value="${n}" ${q.maxAttempts === n ? "selected" : ""}>${n === 0 ? "Ilimitadas" : n}</option>`).join("")}
+            </select>
+          </label>
+          <p class="muted small">Com ${q.questions.length} pergunta(s), é preciso acertar pelo menos <b>${Math.ceil(q.questions.length * (q.passPercent || 0) / 100)}</b>.</p>
+        </section>
+
+        <div class="qz-list">
+          ${q.questions.map((it, i) => `
+            <section class="card qz-q" data-i="${i}">
+              <header>
+                <span class="qz-n">${i + 1}</span>
+                <div class="spacer"></div>
+                <button class="icon-btn" data-up="${i}" title="Subir" ${i === 0 ? "disabled" : ""}>${icon("down", "rot180")}</button>
+                <button class="icon-btn" data-down="${i}" title="Descer" ${i === q.questions.length - 1 ? "disabled" : ""}>${icon("down")}</button>
+                <button class="icon-btn danger" data-qdel="${i}" title="Remover pergunta">${icon("trash")}</button>
+              </header>
+              <textarea class="input qz-text" rows="2" placeholder="Escreva a pergunta…">${esc(it.text)}</textarea>
+              <p class="muted small">Marque a alternativa correta:</p>
+              <div class="qz-opts">
+                ${it.options.map((o, j) => `
+                  <label class="qz-opt ${it.correct === j ? "right" : ""}">
+                    <input type="radio" name="qz-c-${i}" value="${j}" ${it.correct === j ? "checked" : ""} title="Alternativa correta">
+                    <input type="text" class="input" value="${esc(o)}" placeholder="Alternativa ${j + 1}">
+                    <button class="icon-btn" data-odel="${i}:${j}" title="Remover alternativa" ${it.options.length <= 2 ? "disabled" : ""}>${icon("x")}</button>
+                  </label>`).join("")}
+              </div>
+              ${it.options.length < 6 ? `<button class="link-btn" data-oadd="${i}">${icon("plus")} Adicionar alternativa</button>` : ""}
+            </section>`).join("")}
+        </div>
+
+        <button class="btn outline block qz-add" id="qz-add">${icon("plus")} Adicionar pergunta</button>
+
+        <div class="qz-bar card">
+          <span class="muted small" id="qz-dirty">${dirty ? "Alterações não salvas" : "Tudo salvo"}</span>
+          <button class="btn primary lg" id="qz-save">${icon("check")} Salvar questionário</button>
+        </div>
+      `;
+    }
+
+    const host = $("#view");
+    const markDirty = () => { dirty = true; const d = $("#qz-dirty"); if (d) d.textContent = "Alterações não salvas"; };
+    host.addEventListener("input", e => { if (e.target.closest("#qz-body")) markDirty(); });
+    host.addEventListener("change", e => {
+      if (e.target.matches(".qz-opt input[type=radio]")) {
+        $$(`input[name="${e.target.name}"]`).forEach(r => r.closest(".qz-opt").classList.toggle("right", r.checked));
+      }
+      if (e.target.id === "qz-pass") { collect(); draw(); }
+    });
+
+    host.addEventListener("click", async e => {
+      const b = e.target.closest("button, a[data-tab]");
+      if (!b) return;
+      const q = state[cur];
+      const d = b.dataset;
+      if (d.tab !== undefined) { e.preventDefault(); collect(); cur = d.tab; sessionStorage.setItem("icelera.quizTab", cur); return draw(); }
+      if (b.id === "qz-add") {
+        e.preventDefault(); collect();
+        q.questions.push({ text: "", options: ["", "", "", ""], correct: -1 });
+        markDirty(); draw();
+        const last = $$(".qz-q").pop(); last.scrollIntoView({ behavior: "smooth", block: "center" }); $(".qz-text", last).focus();
+        return;
+      }
+      if (d.oadd !== undefined) { e.preventDefault(); collect(); q.questions[+d.oadd].options.push(""); markDirty(); return draw(); }
+      if (d.odel !== undefined) {
+        e.preventDefault(); collect();
+        const [i, j] = d.odel.split(":").map(Number); const it = q.questions[i];
+        it.options.splice(j, 1);
+        if (it.correct === j) it.correct = -1; else if (it.correct > j) it.correct--;
+        markDirty(); return draw();
+      }
+      if (d.qdel !== undefined) { e.preventDefault(); collect(); q.questions.splice(+d.qdel, 1); markDirty(); return draw(); }
+      if (d.up !== undefined || d.down !== undefined) {
+        e.preventDefault(); collect();
+        const i = +(d.up ?? d.down), j = d.up !== undefined ? i - 1 : i + 1;
+        [q.questions[i], q.questions[j]] = [q.questions[j], q.questions[i]];
+        markDirty(); return draw();
+      }
+      if (b.id === "qz-save") {
+        e.preventDefault(); collect();
+        const bad = q.questions.findIndex(it => !it.text.trim() || it.options.some(o => !o.trim()) || it.correct < 0);
+        if (!q.questions.length) return toast("Cadastre ao menos uma pergunta.", "error");
+        if (bad >= 0) {
+          toast(`Pergunta ${bad + 1}: preencha o enunciado e as alternativas, e marque a correta.`, "error");
+          return $$(".qz-q")[bad].scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+        b.disabled = true; b.textContent = "Salvando…";
+        try {
+          const saved = await Api.saveQuiz(cur, { passPercent: q.passPercent, maxAttempts: q.maxAttempts, questions: q.questions.map(it => ({ id: it.id, text: it.text.trim(), options: it.options.map(o => o.trim()), correct: it.correct })) });
+          state[cur] = saved; dirty = false;
+          toast("Questionário de " + cur + " salvo.");
+        } catch (ex) { toast(errMsg(ex), "error"); }
+        draw();
+      }
+    });
+
+    draw();
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Página pública do questionário (o treinado abre pelo link)        */
+  /* ---------------------------------------------------------------- */
+  async function quizPublic(token) {
+    const root = document.getElementById("app");
+    document.title = "Questionário · iCelera";
+    let timer = null;
+    const stop = () => { clearInterval(timer); timer = null; };
+    App.onLeave(stop);
+
+    const frame = inner => {
+      root.innerHTML = `<main class="qp">
+        <header class="qp-head"><img src="assets/logo-icelera.jpg" alt="iCelera"></header>
+        <section class="card qp-card" id="qp">${inner}</section>
+        <p class="legal">© ${new Date().getFullYear()} iCelera</p>
+        <div id="qp-print" aria-hidden="true"></div>
+      </main>`;
+      window.scrollTo(0, 0);
+    };
+    const loading = () => frame(`<div class="qp-loading"><span class="spinner"></span> Carregando…</div>`);
+
+    loading();
+    let info;
+    try { info = await Api.publicQuiz(token); }
+    catch (e) { return frame(`<div class="empty">${icon("alert")}<h2>Link indisponível</h2><p>${esc(errMsg(e))}</p><p class="muted small">Peça um novo link ao técnico que ministrou o treinamento.</p></div>`); }
+
+    const multi = new Set(info.trainees.map(t => t.equipment)).size > 1;
+    const label = t => t.name + (multi || info.trainees.filter(x => x.name === t.name).length > 1 ? " — " + t.equipment : "") + (t.state === "APROVADO" ? " (já aprovado)" : t.state === "BLOQUEADO" ? " (sem tentativas)" : "");
+
+    function pick() {
+      stop();
+      if (!info.trainees.length) return frame(`<div class="empty">${icon("users")}<h2>${esc(info.propertyName)}</h2><p>Ainda não há treinados cadastrados para este questionário.</p></div>`);
+      frame(`
+        <p class="eyebrow">Questionário do treinamento</p>
+        <h1>${esc(info.propertyName)}</h1>
+        <p class="muted">Responda o questionário para receber o seu certificado. Se for aprovado(a), o certificado é emitido e assinado na hora.</p>
+        <label class="field qp-select">
+          <span>Selecione o seu nome</span>
+          <select class="input" id="qp-who">
+            <option value="">Selecione…</option>
+            ${info.trainees.map(t => `<option value="${esc(t.id)}">${esc(label(t))}</option>`).join("")}
+          </select>
+        </label>
+        <p class="muted small">Não encontrou o seu nome? Fale com o técnico que ministrou o treinamento.</p>
+        <p class="form-error" id="qp-err" hidden></p>
+        <button class="btn primary lg block" id="qp-go">Continuar</button>
+      `);
+      $("#qp-go").onclick = () => {
+        const id = $("#qp-who").value;
+        if (!id) { const e = $("#qp-err"); e.textContent = "Selecione o seu nome para continuar."; e.hidden = false; return; }
+        open(id);
+      };
+    }
+
+    async function open(id) {
+      loading();
+      let q;
+      try { q = await Api.publicQuizFor(token, id); }
+      catch (e) { return frame(`<div class="empty">${icon("alert")}<p>${esc(errMsg(e))}</p><button class="btn outline" id="qp-back">Voltar</button></div>`), ($("#qp-back").onclick = pick); }
+      if (q.state === "APROVADO") return done(id, q, null);
+      if (q.state === "BLOQUEADO") return blocked(q);
+      quiz(id, q);
+    }
+
+    const head = q => `
+      <button class="link-btn qp-back" id="qp-back">${icon("back")} Não sou ${esc(firstName(q.name))}</button>
+      <p class="eyebrow">${esc(q.equipment)}</p>
+      <h1>Olá, ${esc(firstName(q.name))}!</h1>`;
+
+    function quiz(id, q) {
+      const left = q.maxAttempts ? q.maxAttempts - q.attemptsUsed : null;
+      frame(`
+        ${head(q)}
+        <p class="muted">Responda as ${q.questions.length} perguntas abaixo. Para ser aprovado(a), acerte pelo menos <b>${q.passPercent}%</b>.
+        ${left !== null ? `Você tem <b>${left} tentativa(s)</b>.` : ""}</p>
+        <div class="qp-progress"><i id="qp-bar"></i></div>
+        <form id="qp-form" novalidate>
+          ${q.questions.map((it, i) => `
+            <fieldset class="qp-q" data-q="${esc(it.id)}">
+              <legend><span>${i + 1}</span>${esc(it.text)}</legend>
+              ${it.options.map((o, j) => `
+                <label class="qp-opt"><input type="radio" name="${esc(it.id)}" value="${j}"><span>${esc(o)}</span></label>`).join("")}
+            </fieldset>`).join("")}
+          <p class="form-error" id="qp-err" hidden></p>
+          <button class="btn primary lg block" id="qp-send" type="submit">${icon("send")} Enviar respostas</button>
+        </form>
+      `);
+      $("#qp-back").onclick = pick;
+      const form = $("#qp-form");
+      const progress = () => {
+        const n = q.questions.filter(it => form.querySelector(`input[name="${CSS.escape(it.id)}"]:checked`)).length;
+        $("#qp-bar").style.width = (n / q.questions.length * 100) + "%";
+      };
+      form.addEventListener("change", e => { e.target.closest(".qp-q").classList.remove("missing"); progress(); });
+      form.onsubmit = async e => {
+        e.preventDefault();
+        const answers = {}; let firstMissing = null;
+        q.questions.forEach(it => {
+          const r = form.querySelector(`input[name="${CSS.escape(it.id)}"]:checked`);
+          const fs = form.querySelector(`[data-q="${CSS.escape(it.id)}"]`);
+          if (r) answers[it.id] = +r.value; else { fs.classList.add("missing"); firstMissing = firstMissing || fs; }
+        });
+        const err = $("#qp-err");
+        if (firstMissing) { err.textContent = "Responda todas as perguntas antes de enviar."; err.hidden = false; return firstMissing.scrollIntoView({ behavior: "smooth", block: "center" }); }
+        const btn = $("#qp-send"); btn.disabled = true; btn.textContent = "Corrigindo…";
+        try {
+          const r = await Api.submitQuiz(token, id, answers);
+          if (r.passed) done(id, { ...q, ...r }, r); else failed(id, q, r);
+        } catch (ex) {
+          err.textContent = errMsg(ex); err.hidden = false;
+          btn.disabled = false; btn.innerHTML = icon("send") + " Enviar respostas";
+        }
+      };
+    }
+
+    function failed(id, q, r) {
+      const left = r.maxAttempts ? r.maxAttempts - r.attemptsUsed : null;
+      frame(`
+        <div class="qp-result">
+          <div class="success-ic fail">${icon("x")}</div>
+          <h1>Não foi dessa vez</h1>
+          <p class="qp-score"><b>${r.correct}</b> de ${r.total} acertos · ${r.percent}%</p>
+          <p class="muted">Para ser aprovado(a) é preciso acertar pelo menos ${r.passPercent}%.</p>
+          ${left === 0
+            ? `<div class="notice warn">${icon("alert")}<span>Você usou todas as tentativas. Fale com o técnico que ministrou o treinamento para liberar uma nova.</span></div>`
+            : `<p class="muted">${left !== null ? `Você ainda tem <b>${left} tentativa(s)</b>.` : ""} Revise o conteúdo do treinamento e tente de novo.</p>
+               <button class="btn primary lg" id="qp-retry">${icon("refresh")} Tentar novamente</button>`}
+        </div>
+      `);
+      const b = $("#qp-retry"); if (b) b.onclick = () => open(id);
+    }
+
+    function blocked(q) {
+      frame(`
+        ${head(q)}
+        <div class="notice warn">${icon("alert")}<span>Você usou todas as ${q.maxAttempts} tentativas do questionário. Fale com o técnico que ministrou o treinamento para liberar uma nova.</span></div>
+      `);
+      $("#qp-back").onclick = pick;
+    }
+
+    function done(id, q, r) {
+      const ready = q.pdfReady;
+      frame(`
+        <div class="qp-result">
+          <div class="success-ic ok">${icon("award")}</div>
+          <h1>${r ? "Parabéns, você foi aprovado(a)!" : "Você já foi aprovado(a)"}</h1>
+          ${r ? `<p class="qp-score"><b>${r.correct}</b> de ${r.total} acertos · ${r.percent}%</p>` : ""}
+          <div id="qp-cert">${certState(q)}</div>
+          <button class="link-btn" id="qp-back">${icon("back")} Voltar para a lista de nomes</button>
+        </div>
+      `);
+      $("#qp-back").onclick = pick;
+      bindPdf(id);
+      if (!ready && q.status !== "AGUARDANDO_ASSINATURA") poll(id);
+    }
+
+    const certState = s => s.pdfReady
+      ? `<p class="muted">O seu certificado foi emitido e assinado digitalmente.</p><button class="btn orange lg" id="qp-pdf">${icon("download")} Baixar certificado</button>`
+      : s.status === "AGUARDANDO_ASSINATURA"
+        ? `<p class="muted">O seu certificado será assinado e enviado pela equipe iCelera em breve.</p>`
+        : `<div class="waiting"><span class="spinner"></span> Emitindo e assinando o seu certificado…</div>`;
+
+    function bindPdf(id) {
+      const b = $("#qp-pdf"); if (!b) return;
+      b.onclick = async () => {
+        b.disabled = true;
+        try {
+          if (Api.mode === "mock") $("#qp-print").innerHTML = certDoc(await Api.publicCertificate(token, id));
+          await Api.publicPdf(token, id);
+        } catch (e) { toast(errMsg(e), "error"); }
+        b.disabled = false;
+      };
+    }
+
+    function poll(id) {
+      stop();
+      let n = 0;
+      timer = setInterval(async () => {
+        if (++n > 60) { stop(); const c = $("#qp-cert"); if (c) c.innerHTML = `<p class="muted">A emissão está demorando mais que o normal. Volte a este link mais tarde para baixar o seu certificado.</p>`; return; }
+        try {
+          const s = await Api.publicStatus(token, id);
+          if (s.pdfReady) { stop(); const c = $("#qp-cert"); if (c) { c.innerHTML = certState(s); bindPdf(id); } }
+        } catch { }
+      }, 3000);
+    }
+
+    pick();
+  }
+
   window.Views = {
+    quizzes,
+    quizPublic,
     login,
     dashboard,
     wizard,
