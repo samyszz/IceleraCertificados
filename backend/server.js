@@ -14,6 +14,7 @@ const { uploadPdfBuffer } = require("./lib/cloudinary"); // Conexão com Cloudin
 const autentique = require("./lib/autentique");
 const { buildCertificatePdf } = require("./lib/pdf");
 const cfg = require("./config");
+const QUIZ_DEFAULTS = require("../js/quiz-defaults");
 
 const { PORT = 3000, JWT_SECRET, FRONTEND_ORIGIN, AUTENTIQUE_WEBHOOK_SECRET, INTERNAL_WEBHOOK_TOKEN } = process.env;
 
@@ -23,9 +24,13 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 }
 
 /* Estados internos */
-const PENDING = ["RASCUNHO", "AGUARDANDO_ASSINATURA", "ASSINATURA_EM_ANDAMENTO"];
+const PENDING = ["AGUARDANDO_QUESTIONARIO", "RASCUNHO", "AGUARDANDO_ASSINATURA", "ASSINATURA_EM_ANDAMENTO"];
 const SIGNED = ["ASSINADO", "EMITIDO"];
-const EDITABLE = ["RASCUNHO", "AGUARDANDO_ASSINATURA"];
+const EDITABLE = ["AGUARDANDO_QUESTIONARIO", "RASCUNHO", "AGUARDANDO_ASSINATURA"];
+
+/* Quem assina automaticamente (Alison). Aceita os dois nomes de variável. */
+const signerEmailCfg = () => String(process.env.AUTENTIQUE_SIGNER_EMAIL || process.env.SIGNER_EMAIL || "").trim().toLowerCase();
+const signerNameCfg = () => String(process.env.AUTENTIQUE_SIGNER_NAME || process.env.SIGNER_NAME || "").trim();
 
 const groupOf = s => (SIGNED.includes(s) ? "assinados" : "aguardando");
 const digits = s => String(s || "").replace(/\D/g, "");
@@ -105,8 +110,11 @@ async function syncFromAutentique(documentId) {
     if (!sig || !sig.signed) return { found: true, status: c.status, signed: false };
 
     if (c.status !== "ASSINADO") {
-      const userSnap = await db.collection('users').doc(c.signerUserId).get();
-      const coord = userSnap.exists ? userSnap.data() : null;
+      let coord = null;
+      if (c.signerUserId && c.signerUserId !== "auto") {
+        const userSnap = await db.collection('users').doc(c.signerUserId).get();
+        coord = userSnap.exists ? userSnap.data() : null;
+      } else if (signerNameCfg()) coord = { name: signerNameCfg() };
 
       c.status = "ASSINADO"; 
       c.signedAt = sig.signed.created_at || now();
@@ -303,14 +311,15 @@ app.post("/api/trainings", auth, role("TECNICO"), async (req, res, next) => {
         id, trainingId, propertyName, propertyDoc, propertyDocType, instructorName,
         equipment: eq, traineeName: t.name.trim(), traineeCpf: t.cpf, date: training.date, format: training.format, hours,
         trainingTitle: customTitle || cfg.TRAINING_TITLE, technicianId: req.user.id, technicianName: req.user.name,
-        dedupKey, status: "AGUARDANDO_ASSINATURA",
+        dedupKey, status: "AGUARDANDO_QUESTIONARIO",
+        quizAttempts: 0, quizLastPercent: null, quizBestPercent: null, quizPassedAt: null,
         autentiqueDocId: null, autentiqueSignerId: null, signerUserId: null, signedAt: null, issuedAt: null, signedBy: null, pdfUrl: null,
         createdAt: now(), updatedAt: now()
       };
       
       await db.collection('certificates').doc(id).set(c);
       created.push(c);
-      await log(id, "ENVIADO_AO_COORDENADOR", req.user.name, "Certificado criado e enviado para assinatura");
+      await log(id, "CRIADO", req.user.name, "Certificado criado. Aguardando o treinado responder o questionário");
     }
     
     res.status(201).json({ trainingId, created, skipped });
@@ -385,7 +394,8 @@ app.post("/api/certificates/:id/sign", auth, role("COORDENADOR"), async (req, re
   const c = snap.data();
   
   if (SIGNED.includes(c.status)) return res.status(409).json({ error: "Este certificado já foi assinado." });
-  if (c.signerUserId && c.signerUserId !== req.user.id) return res.status(403).json({ error: "Aguardando outro Coordenador." });
+  if (c.status === "AGUARDANDO_QUESTIONARIO") return res.status(409).json({ error: "O treinado ainda não foi aprovado no questionário." });
+  if (c.signerUserId && c.signerUserId !== "auto" && c.signerUserId !== req.user.id) return res.status(403).json({ error: "Aguardando outro Coordenador." });
   if (signingLock.has(c.id)) return res.status(409).json({ error: "Assinatura em preparação. Tente novamente." });
   
   signingLock.add(c.id);
@@ -393,7 +403,7 @@ app.post("/api/certificates/:id/sign", auth, role("COORDENADOR"), async (req, re
     if (!c.autentiqueDocId) { 
       const pdfBuffer = await buildCertificatePdf(c, { signerName: req.user.name });
       
-const signerEmail = (process.env.AUTENTIQUE_SIGNER_EMAIL || req.user.email).trim().toLowerCase();
+const signerEmail = signerEmailCfg() || req.user.email.trim().toLowerCase();
 
 const d = await autentique.createDocument({ 
   name: `Certificado iCelera - ${c.traineeName} (${c.id})`, 
@@ -422,10 +432,15 @@ const sig = (d.signatures || []).find(s => String(s.email).toLowerCase() === sig
 
 app.get("/api/certificates/:id/pdf", auth, async (req, res, next) => {
   try {
-    const ref = db.collection('certificates').doc(req.params.id);
-    let snap = await ref.get();
+    const snap = await db.collection('certificates').doc(req.params.id).get();
     if (!snap.exists) return res.status(404).json({ error: "Certificado não encontrado." });
-    let c = snap.data();
+    await sendCertificatePdf(snap.data(), res);
+  } catch (e) { next(e); }
+});
+
+async function sendCertificatePdf(c, res) {
+    const ref = db.collection('certificates').doc(c.id);
+    let snap;
 
     if (!SIGNED.includes(c.status)) return res.status(409).json({ error: "O certificado ainda não foi assinado." });
 
@@ -449,8 +464,7 @@ app.get("/api/certificates/:id/pdf", auth, async (req, res, next) => {
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${c.id}.pdf"`);
     res.send(buf);
-  } catch (e) { next(e); }
-});
+}
 
 app.delete("/api/certificates/:id", auth, role("TECNICO"), async (req, res, next) => {
   try {
@@ -480,6 +494,8 @@ app.patch("/api/properties-bulk", auth, role("TECNICO"), async (req, res, next) 
       await d.ref.update({ propertyName: newName, propertyDoc: newDoc, dedupKey, updatedAt: now() });
       await log(c.id, "EDITADO", req.user.name, "Propriedade alterada");
     }
+    const links = await db.collection('quizLinks').where('propertyKey', '==', propertyKey(oldName, oldDoc)).get();
+    for (const l of links.docs) await l.ref.update({ propertyName: newName, propertyDoc: newDoc, propertyKey: propertyKey(newName, newDoc) });
     res.json({ updated: list.length });
   } catch (e) { next(e); }
 });
@@ -493,6 +509,286 @@ app.delete("/api/properties-bulk", auth, role("TECNICO"), async (req, res, next)
       return res.status(409).json({ error: "Há certificados em assinatura ou assinados nesta propriedade. Não é possível remover." });
     for (const d of list) { await log(d.data().id, "REMOVIDO", req.user.name, "Removido junto com a propriedade"); await d.ref.delete(); }
     res.json({ removed: list.length });
+  } catch (e) { next(e); }
+});
+
+/* ================================================================== */
+/* Questionário de aprovação + emissão automática                     */
+/* ================================================================== */
+/*
+ * Fluxo:
+ *  1. Técnico cadastra o treinamento → certificados nascem em AGUARDANDO_QUESTIONARIO.
+ *  2. Técnico gera 1 link público por instituição (quizLinks/{token}).
+ *  3. O treinado abre o link, escolhe o próprio nome e responde o questionário
+ *     do equipamento dele. A correção é feita AQUI (o navegador nunca recebe o gabarito).
+ *  4. Aprovado → AGUARDANDO_ASSINATURA → autoIssue(): cria o documento no Autentique
+ *     com o Alison como signatário e chama signDocument (token da conta dele).
+ *  5. Se a emissão automática falhar, o certificado fica aguardando assinatura e o
+ *     Coordenador pode assinar pelo fluxo manual de sempre.
+ */
+const slug = s => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+const PASSED_STATES = ["AGUARDANDO_ASSINATURA", "ASSINATURA_EM_ANDAMENTO", "ASSINADO", "EMITIDO"];
+
+function defaultQuiz(equipment) {
+  const qs = (QUIZ_DEFAULTS.byEquipment[equipment] || []).map((q, i) => ({ id: "q" + (i + 1), ...q }));
+  return { equipment, passPercent: QUIZ_DEFAULTS.passPercent, maxAttempts: QUIZ_DEFAULTS.maxAttempts, questions: qs, custom: false, updatedAt: null, updatedBy: null };
+}
+
+async function getQuiz(equipment) {
+  const snap = await db.collection('quizzes').doc(slug(equipment)).get();
+  return snap.exists ? { ...defaultQuiz(equipment), ...snap.data(), custom: true } : defaultQuiz(equipment);
+}
+
+/** Em que ponto do questionário o treinado está. */
+function quizState(c, quiz) {
+  if (c.quizPassedAt || PASSED_STATES.includes(c.status)) return "APROVADO";
+  if (quiz.maxAttempts > 0 && (c.quizAttempts || 0) >= quiz.maxAttempts) return "BLOQUEADO";
+  return "PENDENTE";
+}
+
+/* ---- Emissão automática ---- */
+const issueLock = new Set();
+async function autoIssue(certId) {
+  if (issueLock.has(certId)) return;
+  issueLock.add(certId);
+  const ref = db.collection('certificates').doc(certId);
+  try {
+    let c = (await ref.get()).data();
+    if (!c || SIGNED.includes(c.status)) return;
+
+    // Documento já existe (nova tentativa): vê primeiro se já foi assinado.
+    if (c.autentiqueDocId) {
+      const r = await syncFromAutentique(c.autentiqueDocId);
+      if (r.signed) return;
+    } else {
+      const signerEmail = signerEmailCfg();
+      if (!signerEmail) throw Object.assign(new Error("AUTENTIQUE_SIGNER_EMAIL não configurado."), { code: "NOT_CONFIGURED" });
+
+      const pdfBuffer = await buildCertificatePdf(c);
+      const d = await autentique.createDocument({
+        name: `Certificado iCelera - ${c.traineeName} (${c.id})`,
+        pdf: pdfBuffer, filename: c.id + ".pdf", signerEmail
+      });
+      const sig = (d.signatures || []).find(s => String(s.email).toLowerCase() === signerEmail) || (d.signatures || [])[0];
+      if (!sig) throw new Error("Autentique não retornou o signatário.");
+
+      c = { ...c, autentiqueDocId: d.id, autentiqueSignerId: sig.public_id, signerUserId: "auto", status: "ASSINATURA_EM_ANDAMENTO", autoIssueError: null, updatedAt: now() };
+      await ref.update(c);
+      await log(c.id, "ASSINATURA_INICIADA", "Sistema", "Documento criado no Autentique (" + d.id + ") para assinatura automática");
+    }
+
+    await autentique.signDocument(c.autentiqueDocId);
+    await log(c.id, "ASSINATURA_AUTOMATICA", signerNameCfg() || "Sistema", "Assinado automaticamente via Autentique após aprovação no questionário");
+    lastSync.set(c.id, Date.now());
+    // O PDF assinado pode levar alguns segundos para ficar pronto; se não ficar agora,
+    // a consulta de status (tela do treinado / do sistema) termina a emissão depois.
+    try { await syncFromAutentique(c.autentiqueDocId); } catch (e) { console.warn("[auto-issue sync] " + e.message); }
+  } catch (e) {
+    console.error("[auto-issue] " + certId + ": " + e.message);
+    await ref.update({ autoIssueError: e.message, updatedAt: now() }).catch(() => { });
+    await log(certId, "EMISSAO_AUTOMATICA_FALHOU", "Sistema", "Falha na emissão automática (" + e.message + "). O Coordenador pode assinar manualmente.");
+  } finally {
+    issueLock.delete(certId);
+  }
+}
+
+/* ---- Rate limit simples para as rotas públicas ---- */
+const pubHits = new Map();
+function publicLimit(req, res, next) {
+  const ip = req.ip, t = Date.now(), r = pubHits.get(ip) || { n: 0, t };
+  if (t - r.t > 60000) { r.n = 0; r.t = t; }
+  r.n++; pubHits.set(ip, r);
+  if (r.n > 120) return res.status(429).json({ error: "Muitas requisições. Aguarde um minuto." });
+  next();
+}
+
+async function linkFromReq(req, res) {
+  const token = String(req.params.token || "");
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(token)) { res.status(404).json({ error: "Link inválido." }); return null; }
+  const snap = await db.collection('quizLinks').doc(token).get();
+  if (!snap.exists || snap.data().disabled) { res.status(404).json({ error: "Link inválido ou desativado." }); return null; }
+  return snap.data();
+}
+
+const belongs = (c, link) => propertyKey(c.propertyName, c.propertyDoc) === link.propertyKey;
+
+async function certFromLink(req, res, link) {
+  const snap = await db.collection('certificates').doc(String(req.params.certId || "")).get();
+  if (!snap.exists || !belongs(snap.data(), link)) { res.status(404).json({ error: "Treinado não encontrado neste link." }); return null; }
+  return snap.data();
+}
+
+const publicStatus = c => ({
+  status: SIGNED.includes(c.status) ? "ASSINADO" : c.status,
+  pdfReady: !!(c.pdfUrl || c.status === "EMITIDO")
+});
+
+/* ---- Rotas públicas (sem login) ---- */
+app.get("/api/public/quiz/:token", publicLimit, async (req, res, next) => {
+  try {
+    const link = await linkFromReq(req, res); if (!link) return;
+    const snap = await db.collection('certificates').where('propertyName', '==', link.propertyName).get();
+    const certs = snap.docs.map(d => d.data()).filter(c => belongs(c, link) && (c.status === "AGUARDANDO_QUESTIONARIO" || c.quizPassedAt));
+    const quizzes = {};
+    for (const eq of new Set(certs.map(c => c.equipment))) quizzes[eq] = await getQuiz(eq);
+    res.json({
+      propertyName: link.propertyName,
+      // Só o nome e o equipamento: CPF e demais dados não saem do sistema.
+      trainees: certs
+        .map(c => ({ id: c.id, name: c.traineeName, equipment: c.equipment, date: c.date, state: quizState(c, quizzes[c.equipment]) }))
+        .sort((a, b) => a.name.localeCompare(b.name, "pt-BR") || a.equipment.localeCompare(b.equipment))
+    });
+  } catch (e) { next(e); }
+});
+
+app.get("/api/public/quiz/:token/:certId", publicLimit, async (req, res, next) => {
+  try {
+    const link = await linkFromReq(req, res); if (!link) return;
+    const c = await certFromLink(req, res, link); if (!c) return;
+    const quiz = await getQuiz(c.equipment);
+    const state = quizState(c, quiz);
+    const base = { id: c.id, name: c.traineeName, equipment: c.equipment, state, attemptsUsed: c.quizAttempts || 0, maxAttempts: quiz.maxAttempts, passPercent: quiz.passPercent, ...publicStatus(c) };
+    if (state !== "PENDENTE") return res.json(base);
+    if (!quiz.questions.length) return res.status(409).json({ error: "O questionário deste equipamento ainda não foi cadastrado. Fale com o técnico." });
+    // Gabarito NUNCA vai para o navegador.
+    res.json({ ...base, questions: quiz.questions.map(q => ({ id: q.id, text: q.text, options: q.options })) });
+  } catch (e) { next(e); }
+});
+
+app.post("/api/public/quiz/:token/:certId", publicLimit, async (req, res, next) => {
+  try {
+    const link = await linkFromReq(req, res); if (!link) return;
+    const c0 = await certFromLink(req, res, link); if (!c0) return;
+    const quiz = await getQuiz(c0.equipment);
+    const answers = (req.body && req.body.answers) || {};
+
+    if (!quiz.questions.length) return res.status(409).json({ error: "Questionário não cadastrado." });
+    if (quiz.questions.some(q => !Number.isInteger(answers[q.id]) || answers[q.id] < 0 || answers[q.id] >= q.options.length))
+      return res.status(400).json({ error: "Responda todas as perguntas antes de enviar." });
+
+    const correct = quiz.questions.filter(q => answers[q.id] === q.correct).length;
+    const total = quiz.questions.length;
+    const percent = Math.round((correct / total) * 100);
+    const passed = percent >= quiz.passPercent;
+
+    // Transação: evita duas aprovações / tentativas extras com cliques simultâneos.
+    const ref = db.collection('certificates').doc(c0.id);
+    const out = await db.runTransaction(async t => {
+      const c = (await t.get(ref)).data();
+      if (!c || c.status !== "AGUARDANDO_QUESTIONARIO") return { error: "Este questionário já foi respondido e aprovado.", code: 409 };
+      if (quizState(c, quiz) === "BLOQUEADO") return { error: "Você atingiu o limite de tentativas. Fale com o técnico que ministrou o treinamento.", code: 409 };
+      const attempts = (c.quizAttempts || 0) + 1;
+      const upd = {
+        quizAttempts: attempts, quizLastPercent: percent,
+        quizBestPercent: Math.max(c.quizBestPercent || 0, percent), updatedAt: now()
+      };
+      if (passed) Object.assign(upd, { status: "AGUARDANDO_ASSINATURA", quizPassedAt: now() });
+      t.update(ref, upd);
+      return { attempts };
+    });
+    if (out.error) return res.status(out.code).json({ error: out.error });
+
+    await db.collection('quizAttempts').add({
+      id: crypto.randomUUID(), at: now(), certificateId: c0.id, equipment: c0.equipment,
+      answers, correct, total, percent, passed, ip: req.ip
+    });
+    await log(c0.id, passed ? "QUESTIONARIO_APROVADO" : "QUESTIONARIO_REPROVADO", c0.traineeName,
+      `Acertou ${correct} de ${total} (${percent}%) · tentativa ${out.attempts}${quiz.maxAttempts ? " de " + quiz.maxAttempts : ""}`);
+
+    if (passed) await autoIssue(c0.id);
+
+    const c = (await ref.get()).data();
+    res.json({
+      passed, correct, total, percent, passPercent: quiz.passPercent,
+      attemptsUsed: out.attempts, maxAttempts: quiz.maxAttempts,
+      state: quizState(c, quiz), ...publicStatus(c)
+    });
+  } catch (e) { next(e); }
+});
+
+/** Consulta de status (a tela do treinado chama em intervalo até o PDF ficar pronto). */
+app.get("/api/public/quiz/:token/:certId/status", publicLimit, async (req, res, next) => {
+  try {
+    const link = await linkFromReq(req, res); if (!link) return;
+    let c = await certFromLink(req, res, link); if (!c) return;
+    if (c.autentiqueDocId && c.status !== "EMITIDO" && Date.now() - (lastSync.get(c.id) || 0) > 5000) {
+      lastSync.set(c.id, Date.now());
+      try { await syncFromAutentique(c.autentiqueDocId); } catch (e) { console.warn("[public sync] " + e.message); }
+      c = (await db.collection('certificates').doc(c.id).get()).data();
+    }
+    res.json(publicStatus(c));
+  } catch (e) { next(e); }
+});
+
+app.get("/api/public/quiz/:token/:certId/pdf", publicLimit, async (req, res, next) => {
+  try {
+    const link = await linkFromReq(req, res); if (!link) return;
+    const c = await certFromLink(req, res, link); if (!c) return;
+    await sendCertificatePdf(c, res);
+  } catch (e) { next(e); }
+});
+
+/* ---- Rotas internas (com login) ---- */
+
+/** Gera (ou devolve o já existente) link do questionário de uma instituição. */
+app.post("/api/quiz-links", auth, async (req, res, next) => {
+  try {
+    const name = String((req.body || {}).propertyName || "").trim();
+    const doc = String((req.body || {}).propertyDoc || "").trim();
+    if (!name) return res.status(400).json({ error: "Informe a instituição." });
+    const key = propertyKey(name, doc);
+    const found = await db.collection('quizLinks').where('propertyKey', '==', key).limit(1).get();
+    if (!found.empty) return res.json(found.docs[0].data());
+    const link = { token: crypto.randomBytes(18).toString("base64url"), propertyKey: key, propertyName: name, propertyDoc: doc, createdAt: now(), createdBy: req.user.name, disabled: false };
+    await db.collection('quizLinks').doc(link.token).set(link);
+    res.status(201).json(link);
+  } catch (e) { next(e); }
+});
+
+app.get("/api/quizzes", auth, async (req, res, next) => {
+  try { res.json(await Promise.all(cfg.EQUIPMENTS.map(getQuiz))); } catch (e) { next(e); }
+});
+
+app.put("/api/quizzes/:equipment", auth, async (req, res, next) => {
+  try {
+    const equipment = String(req.params.equipment);
+    if (!cfg.EQUIPMENTS.includes(equipment)) return res.status(400).json({ error: "Equipamento inválido." });
+    const b = req.body || {};
+    const passPercent = Number(b.passPercent), maxAttempts = Number(b.maxAttempts);
+    if (!Number.isInteger(passPercent) || passPercent < 1 || passPercent > 100) return res.status(400).json({ error: "Nota mínima deve ser de 1 a 100%." });
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 0 || maxAttempts > 20) return res.status(400).json({ error: "Tentativas deve ser de 0 (ilimitado) a 20." });
+    if (!Array.isArray(b.questions) || !b.questions.length || b.questions.length > 50) return res.status(400).json({ error: "Cadastre de 1 a 50 perguntas." });
+
+    const used = new Set();
+    const questions = [];
+    for (const [i, q] of b.questions.entries()) {
+      const text = String(q.text || "").trim();
+      const options = Array.isArray(q.options) ? q.options.map(o => String(o || "").trim()) : [];
+      const n = i + 1;
+      if (text.length < 3) return res.status(400).json({ error: `Pergunta ${n}: escreva o enunciado.` });
+      if (options.length < 2 || options.length > 6 || options.some(o => !o)) return res.status(400).json({ error: `Pergunta ${n}: use de 2 a 6 alternativas, todas preenchidas.` });
+      if (!Number.isInteger(q.correct) || q.correct < 0 || q.correct >= options.length) return res.status(400).json({ error: `Pergunta ${n}: marque a alternativa correta.` });
+      let id = /^q[\w-]{1,40}$/.test(q.id || "") && !used.has(q.id) ? q.id : "q" + crypto.randomBytes(4).toString("hex");
+      used.add(id);
+      questions.push({ id, text, options, correct: q.correct });
+    }
+    const quiz = { equipment, passPercent, maxAttempts, questions, updatedAt: now(), updatedBy: req.user.name };
+    await db.collection('quizzes').doc(slug(equipment)).set(quiz);
+    res.json({ ...quiz, custom: true });
+  } catch (e) { next(e); }
+});
+
+/** Libera novas tentativas para quem esgotou o limite. */
+app.post("/api/certificates/:id/reset-quiz", auth, role("TECNICO"), async (req, res, next) => {
+  try {
+    const ref = db.collection('certificates').doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: "Certificado não encontrado." });
+    const c = snap.data();
+    if (c.status !== "AGUARDANDO_QUESTIONARIO") return res.status(409).json({ error: "Este treinado não está aguardando o questionário." });
+    await ref.update({ quizAttempts: 0, updatedAt: now() });
+    await log(c.id, "TENTATIVAS_LIBERADAS", req.user.name, "Tentativas do questionário liberadas novamente");
+    res.json({ ...c, quizAttempts: 0 });
   } catch (e) { next(e); }
 });
 
