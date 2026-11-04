@@ -14,7 +14,7 @@ const SANDBOX = () => String(process.env.AUTENTIQUE_SANDBOX || "true").toLowerCa
 
 function headers() {
   // Aceita os dois nomes (o .env da raiz usa AUTENTIQUE_TOKEN).
-  const t = process.env.AUTENTIQUE_API_TOKEN || process.env.AUTENTIQUE_TOKEN;
+  const t = String(process.env.AUTENTIQUE_API_TOKEN || process.env.AUTENTIQUE_TOKEN || "").trim().replace(/^["']|["']$/g, "");
   if (!t) throw Object.assign(new Error("AUTENTIQUE_API_TOKEN não configurado."), { code: "NOT_CONFIGURED" });
   return { Authorization: "Bearer " + t };
 }
@@ -23,7 +23,12 @@ async function post(init) {
   const res = await fetch(URL_(), init);
   const json = await res.json().catch(() => ({}));
   if (!res.ok || json.errors) {
-    const msg = (json.errors && json.errors.map(e => e.message).join("; ")) || "HTTP " + res.status;
+    // Inclui o detalhe da validação (qual campo o Autentique recusou), não só "validation".
+    const msg = (json.errors && json.errors.map(e => {
+      const ext = e.extensions || {};
+      const det = ext.validation || ext.errors || ext.reason || ext.debugMessage;
+      return e.message + (det ? " " + (typeof det === "string" ? det : JSON.stringify(det)) : "");
+    }).join("; ")) || "HTTP " + res.status;
     throw Object.assign(new Error("Autentique: " + msg), { code: "AUTENTIQUE_ERROR" });
   }
   return json.data;
