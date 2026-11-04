@@ -29,8 +29,10 @@ const SIGNED = ["ASSINADO", "EMITIDO"];
 const EDITABLE = ["AGUARDANDO_QUESTIONARIO", "RASCUNHO", "AGUARDANDO_ASSINATURA"];
 
 /* Quem assina automaticamente (Alison). Aceita os dois nomes de variável. */
-const signerEmailCfg = () => String(process.env.AUTENTIQUE_SIGNER_EMAIL || process.env.SIGNER_EMAIL || "").trim().toLowerCase();
-const signerNameCfg = () => String(process.env.AUTENTIQUE_SIGNER_NAME || process.env.SIGNER_NAME || "").trim();
+// Remove espaços e aspas que às vezes vêm junto quando o valor é colado na Vercel.
+const cleanEnv = v => String(v || "").trim().replace(/^["']+|["']+$/g, "").trim();
+const signerEmailCfg = () => cleanEnv(process.env.AUTENTIQUE_SIGNER_EMAIL || process.env.SIGNER_EMAIL).toLowerCase();
+const signerNameCfg = () => cleanEnv(process.env.AUTENTIQUE_SIGNER_NAME || process.env.SIGNER_NAME);
 
 const groupOf = s => (SIGNED.includes(s) ? "assinados" : "aguardando");
 const digits = s => String(s || "").replace(/\D/g, "");
@@ -385,13 +387,31 @@ app.patch("/api/certificates/:id", auth, role("TECNICO"), async (req, res) => {
   res.json(c);
 });
 
+/**
+ * Se o documento já criado no Autentique tem OUTRO signatário (ex.: e-mail trocado na Vercel
+ * depois que o documento foi criado), descarta esse documento para que um novo seja criado
+ * com o signatário certo. Documento já assinado nunca é descartado.
+ */
+async function discardDocIfWrongSigner(c, signerEmail) {
+  if (!c.autentiqueDocId || !signerEmail) return c;
+  let doc;
+  try { doc = await autentique.getDocument(c.autentiqueDocId); } catch (e) { console.warn("[signer-check] " + e.message); return c; }
+  const sigs = (doc && doc.signatures) || [];
+  const sig = sigs.find(x => x.public_id === c.autentiqueSignerId) || sigs[0];
+  if (!sig || sig.signed || String(sig.email || "").toLowerCase() === signerEmail) return c;
+  const upd = { autentiqueDocId: null, autentiqueSignerId: null, signerUserId: null, status: "AGUARDANDO_ASSINATURA", autoIssueError: null, updatedAt: now() };
+  await db.collection('certificates').doc(c.id).update(upd);
+  await log(c.id, "DOCUMENTO_REFEITO", "Sistema", `Documento ${c.autentiqueDocId} tinha o signatário ${sig.email}; será criado outro para ${signerEmail}`);
+  return { ...c, ...upd };
+}
+
 const signingLock = new Set();
 app.post("/api/certificates/:id/sign", auth, role("COORDENADOR"), async (req, res, next) => {
   const certRef = db.collection('certificates').doc(req.params.id);
   const snap = await certRef.get();
   
   if (!snap.exists) return res.status(404).json({ error: "Certificado não encontrado." });
-  const c = snap.data();
+  let c = snap.data();
   
   if (SIGNED.includes(c.status)) return res.status(409).json({ error: "Este certificado já foi assinado." });
   if (c.status === "AGUARDANDO_QUESTIONARIO") return res.status(409).json({ error: "O treinado ainda não foi aprovado no questionário." });
@@ -400,6 +420,7 @@ app.post("/api/certificates/:id/sign", auth, role("COORDENADOR"), async (req, re
   
   signingLock.add(c.id);
   try {
+    c = await discardDocIfWrongSigner(c, signerEmailCfg() || req.user.email.trim().toLowerCase());
     if (!c.autentiqueDocId) { 
       const pdfBuffer = await buildCertificatePdf(c, { signerName: req.user.name });
       
@@ -556,7 +577,8 @@ async function autoIssue(certId) {
     let c = (await ref.get()).data();
     if (!c || SIGNED.includes(c.status)) return;
 
-    // Documento já existe (nova tentativa): vê primeiro se já foi assinado.
+    // Documento já existe (nova tentativa): confere o signatário e vê se já foi assinado.
+    if (c.autentiqueDocId) c = await discardDocIfWrongSigner(c, signerEmailCfg());
     if (c.autentiqueDocId) {
       const r = await syncFromAutentique(c.autentiqueDocId);
       if (r.signed) return;
@@ -806,7 +828,7 @@ app.use("/api", (req, res) => res.status(404).json({ error: "Rota não encontrad
 app.use((err, req, res, next) => {
   console.error("[erro]", err.message);
   if (err.code === "NOT_CONFIGURED") return res.status(503).json({ error: "Integração com Autentique não configurada." });
-  if (err.code === "AUTENTIQUE_ERROR") return res.status(502).json({ error: "Falha ao comunicar com o Autentique." });
+  if (err.code === "AUTENTIQUE_ERROR") return res.status(502).json({ error: "Falha ao comunicar com o Autentique: " + err.message.replace(/^Autentique:\s*/, "") });
   res.status(500).json({ error: "Erro interno do servidor." });
 });
 
