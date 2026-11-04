@@ -1596,7 +1596,8 @@
     QUESTIONARIO_REPROVADO: ["x", "Reprovado no questionário"],
     TENTATIVAS_LIBERADAS: ["refresh", "Tentativas liberadas"],
     ASSINATURA_AUTOMATICA: ["shield", "Assinado automaticamente"],
-    EMISSAO_AUTOMATICA_FALHOU: ["alert", "Falha na emissão automática"]
+    EMISSAO_AUTOMATICA_FALHOU: ["alert", "Falha na emissão automática"],
+    DOCUMENTO_REFEITO: ["refresh", "Documento refeito com o signatário certo"]
   };
 
   async function history() {
